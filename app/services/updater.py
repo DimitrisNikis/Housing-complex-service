@@ -46,12 +46,16 @@ class DataUpdater:
             offset = 0
             
             while True:
-                # Получаем страницу данных
-                page_complexes = await self.parser.fetch_complexes(
+                # Получаем страницу данных с метаинформацией
+                fetch_result = await self.parser.fetch_complexes(
                     offset=offset,
                     limit=page_size,
-                    search=search_city
+                    search=search_city,
+                    return_metadata=True
                 )
+                
+                page_complexes = fetch_result.complexes
+                total_requested = fetch_result.total_requested
                 
                 if not page_complexes:
                     logger.debug(f"Больше нет данных, остановка пагинации на offset={offset}")
@@ -59,7 +63,7 @@ class DataUpdater:
                 
                 all_complex_dtos.extend(page_complexes)
                 logger.info(
-                    f"Загружено страница: {len(page_complexes)} ЖК "
+                    f"Загружено страница: {len(page_complexes)} ЖК (запрошено у API: {total_requested}) "
                     f"(offset={offset}, всего: {len(all_complex_dtos)})"
                 )
                 
@@ -69,9 +73,10 @@ class DataUpdater:
                     logger.info(f"Достигнут лимит максимального количества результатов: {max_results}")
                     break
                 
-                # Если получили меньше, чем запрашивали - это последняя страница
-                if len(page_complexes) < page_size:
-                    logger.debug(f"Получено меньше запрошенного ({len(page_complexes)} < {page_size}), последняя страница")
+                # Если API вернул меньше, чем запрашивали - это последняя страница
+                # Важно: проверяем total_requested (до фильтрации), а не len(page_complexes) (после фильтрации)
+                if total_requested < page_size:
+                    logger.debug(f"API вернул меньше запрошенного ({total_requested} < {page_size}), последняя страница")
                     break
                 
                 offset += page_size

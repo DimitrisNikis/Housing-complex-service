@@ -1,5 +1,5 @@
 """Парсер данных о жилых комплексах с наш.дом.рф через API с использованием Playwright и Stealth."""
-from typing import List, Optional
+from typing import List, Optional, NamedTuple
 from pydantic import ValidationError
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from playwright_stealth import Stealth
@@ -10,6 +10,12 @@ import re
 
 from app.schemas.parser import ComplexParsedDTO
 from app.config import get_settings
+
+
+class FetchResult(NamedTuple):
+    """Результат запроса парсера с метаинформацией."""
+    complexes: List[ComplexParsedDTO]  # Отфильтрованные результаты
+    total_requested: int  # Количество записей, запрошенных у API (до фильтрации)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -275,8 +281,9 @@ class NashDomParser:
         self,
         offset: int = 0,
         limit: int = 100,
-        search: str = ""
-    ) -> List[ComplexParsedDTO]:
+        search: str = "",
+        return_metadata: bool = False
+    ) -> List[ComplexParsedDTO] | FetchResult:
         """
         Получить список жилых комплексов через API с использованием Playwright и Stealth.
         
@@ -291,10 +298,15 @@ class NashDomParser:
         Args:
             offset: Смещение для пагинации (по умолчанию 0)
             limit: Количество результатов на странице (по умолчанию 100)
-            search: Поисковый запрос (по умолчанию пустая строка)
+            search: Поисковый запрос для фильтрации по городу (по умолчанию пустая строка)
+            return_metadata: Если True, возвращает FetchResult с метаинформацией о количестве
+                           запрошенных записей (до фильтрации). Если False, возвращает только
+                           список ComplexParsedDTO (по умолчанию False)
             
         Returns:
-            Список объектов ComplexParsedDTO с данными о жилых комплексах
+            Если return_metadata=False: Список объектов ComplexParsedDTO с данными о жилых комплексах
+            Если return_metadata=True: FetchResult(complexes, total_requested) с отфильтрованными
+                                      результатами и количеством запрошенных у API (до фильтрации)
             
         Raises:
             ValidationError: При ошибках валидации данных
@@ -302,9 +314,16 @@ class NashDomParser:
             
         Пример использования:
             parser = NashDomParser()
+            # Простой вызов - возвращает только список
             complexes = await parser.fetch_complexes(offset=0, limit=50, search="Москва")
             for complex_dto in complexes:
                 print(f"{complex_dto.name} - {complex_dto.address}")
+            
+            # Вызов с метаинформацией для пагинации
+            result = await parser.fetch_complexes(offset=0, limit=1000, search="Москва", return_metadata=True)
+            filtered_complexes = result.complexes  # Отфильтрованные результаты
+            total_requested = result.total_requested  # Сколько запрошено у API (до фильтрации)
+            
             await parser.close()
         """
         page: Optional[Page] = None
@@ -375,9 +394,13 @@ class NashDomParser:
             
             if not complexes_list:
                 logger.warning("Список ЖК пуст в JSON ответе")
+                if return_metadata:
+                    return FetchResult(complexes=[], total_requested=0)
                 return []
             
-            logger.info(f"Найдено {len(complexes_list)} ЖК в JSON ответе")
+            # Сохраняем количество запрошенных у API (до фильтрации)
+            total_requested = len(complexes_list)
+            logger.info(f"Найдено {total_requested} ЖК в JSON ответе")
             
             # Фильтруем по городу, если указан параметр search
             if search:
@@ -405,6 +428,9 @@ class NashDomParser:
                     continue
             
             logger.info(f"✓ Успешно обработано {len(complexes)} ЖК из {len(complexes_list)} полученных")
+            
+            if return_metadata:
+                return FetchResult(complexes=complexes, total_requested=total_requested)
             return complexes
             
         except Exception as e:
