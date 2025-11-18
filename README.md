@@ -1,2 +1,762 @@
-# Housing-complex-service
-Микросервис для сбора и актуализации данных о жилых комплексах и привязке адресов домов к ЖК. Парсинг внешних данных, хранение в PostgreSQL, REST API на FastAPI и Docker-среда.
+# Housing Complex Service
+
+Микросервис для сбора и актуализации данных о жилых комплексах (ЖК) из внешних источников и управления привязкой домов к ЖК через REST API.
+
+## Описание
+
+Сервис решает следующие задачи:
+
+1. **Парсинг данных** - собирает информацию о ЖК из внешних источников (nashdom.rf) для города Москвы
+2. **Актуализация данных** - автоматически обновляет данные о ЖК, отслеживая изменения через сравнение хэшей
+3. **REST API** - предоставляет API для управления привязками домов к ЖК
+4. **Авторизация** - защищает API с помощью JWT-токенов
+
+## Архитектура
+
+### Структура проекта
+
+```
+housing-complex-service/
+├── app/
+│   ├── __init__.py
+│   ├── main.py              # Точка входа FastAPI приложения
+│   ├── config.py            # Конфигурация (настройки из .env)
+│   ├── database.py          # Подключение к PostgreSQL, SQLAlchemy
+│   │
+│   ├── models/              # SQLAlchemy модели БД
+│   │   ├── __init__.py
+│   │   ├── housing_complex.py  # Модель ЖК
+│   │   ├── house.py            # Модель дома
+│   │   ├── binding.py          # Модель привязки дом→ЖК
+│   │   └── user.py             # Модель пользователя
+│   │
+│   ├── schemas/             # Pydantic схемы для валидации
+│   │   ├── __init__.py
+│   │   ├── housing_complex.py
+│   │   ├── house.py
+│   │   ├── binding.py
+│   │   ├── auth.py
+│   │   └── parser.py           # Схемы для парсера (ComplexParsedDTO)
+│   │
+│   ├── api/                 # FastAPI роуты
+│   │   ├── __init__.py
+│   │   ├── bindings.py      # API для привязок (GET, POST, DELETE)
+│   │   └── auth.py          # API для авторизации (register, login, me)
+│   │
+│   ├── services/            # Бизнес-логика
+│   │   ├── __init__.py
+│   │   ├── parser.py        # Парсер данных с наш.дом.рф (Playwright + Stealth)
+│   │   ├── updater.py       # Сервис актуализации данных
+│   │   └── auth.py          # JWT логика авторизации (работа с БД)
+│   │
+│   └── utils/               # Утилиты
+│       ├── __init__.py
+│       └── hashing.py       # Хэширование для отслеживания изменений
+│
+├── alembic/                 # Миграции БД
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│
+├── tests/                   # Тесты
+│   ├── __init__.py
+│   └── test_parser.py       # Тесты парсера
+│
+├── scripts/                 # Вспомогательные скрипты
+│   └── init_test_data.py    # Инициализация тестовых данных
+│
+├── Dockerfile               # Docker образ приложения
+├── docker-compose.yml       # Docker Compose конфигурация
+├── requirements.txt         # Python зависимости
+├── alembic.ini             # Конфигурация Alembic
+└── README.md
+```
+
+### Компоненты системы
+
+#### 1. Модели данных (SQLAlchemy)
+
+- **HousingComplex** - жилые комплексы
+  - Поля: `id`, `name`, `description`, `developer`, `source_url`, `data_hash`, `created_at`, `updated_at`
+  - `data_hash` используется для отслеживания изменений (SHA-256 хэш значимых полей: name, description, developer)
+  - `source_url` уникальный (формируется из `hobjId`: `/сервисы/kn/{hobjId}`)
+  - Адрес хранится у домов, а не у ЖК
+  
+- **House** - дома
+  - Поля: `id`, `address` (уникальный), `floors` (этажность, опционально), `apartments_count` (количество квартир, опционально)
+  - Поля `floors` и `apartments_count` заполняются вручную через API
+  
+- **Binding** - привязки дом→ЖК
+  - Поля: `id`, `house_id`, `housing_complex_id`, `created_at`
+  - Уникальное ограничение на пару `(house_id, housing_complex_id)`
+  
+- **User** - пользователи (для авторизации)
+  - Поля: `id`, `username` (уникальный), `hashed_password`, `is_active`, `created_at`, `updated_at`
+  - Пароли хранятся в хэшированном виде (bcrypt)
+
+#### 2. Парсер данных (`app/services/parser.py`)
+
+- Класс `NashDomParser` для парсинга данных с наш.дом.рф
+- Использует **Playwright с Stealth** для обхода антибот-системы ServicePipe
+- Выполняет API запросы через `page.evaluate()` с JavaScript fetch для максимальной имитации браузера
+- Использует известный API endpoint `/сервисы/api/kn/object`
+- Парсит JSON ответы (структура `data.list`) вместо HTML
+- Поддерживает headless и non-headless режимы (настраивается через `PARSER_HEADLESS`)
+- Настраивается через `config.py` (город, режим браузера, таймауты)
+
+#### 3. Актуализация данных (`app/services/updater.py`)
+
+- Класс `DataUpdater` для обновления данных о ЖК
+- Логика работы:
+  1. Парсит данные из источника
+  2. Для каждого ЖК вычисляет хэш значимых полей
+  3. Ищет существующий ЖК по `source_url`
+  4. Если не найден → добавляет новый
+  5. Если найден и хэш изменился → обновляет данные
+  6. Если найден и хэш не изменился → пропускает
+
+#### 4. Периодическая задача (APScheduler)
+
+- Настроена в `app/main.py` через `lifespan` контекст
+- Запускается каждые N часов (настраивается через `PARSER_SCHEDULER_HOURS`)
+- Выполняет первую актуализацию при старте приложения
+
+#### 5. REST API (FastAPI)
+
+**Эндпоинты авторизации:**
+- `POST /api/v1/auth/register` - регистрация нового пользователя
+  - Требует: `username`, `password`
+  - Возвращает данные созданного пользователя
+  
+- `POST /api/v1/auth/login` - получение JWT токена
+  - Требует `username` и `password` (OAuth2 форма)
+  - Возвращает `access_token` и `token_type`
+  
+- `GET /api/v1/auth/me` - информация о текущем пользователе
+  - Требует авторизацию (JWT токен)
+
+**Эндпоинты привязок** (требуют авторизацию):
+- `POST /api/v1/bindings` - создать привязку дом→ЖК
+  - Автоматически создает дом по адресу, если его еще нет
+  - Если дом с таким адресом существует, использует его и обновляет `floors` и `apartments_count` (если указаны)
+  - Валидация: проверка существования ЖК, отсутствие дубликатов привязок
+  - Требует: `housing_complex_id`, `address`
+  - Опционально: `floors` (этажность), `apartments_count` (количество квартир)
+  
+- `GET /api/v1/bindings` - список привязок
+  - Поддержка пагинации (`skip`, `limit`)
+  - Фильтры: `house_id`, `housing_complex_id`
+  - Возвращает: `{"items": [...], "total": N}`
+  
+- `DELETE /api/v1/bindings/{id}` - удалить привязку
+  - Возвращает 204 No Content
+
+#### 6. Авторизация JWT (`app/services/auth.py`)
+
+- Использует `python-jose` для создания и проверки JWT токенов
+- Пароли хэшируются через `passlib` (bcrypt)
+- Пользователи хранятся в БД (таблица `users`)
+- Нет предсозданных пользователей - необходимо зарегистрироваться через `/auth/register`
+- Токен действителен 30 минут (настраивается через `ACCESS_TOKEN_EXPIRE_MINUTES`)
+
+### Технологический стек
+
+- **Python 3.11** - язык программирования
+- **FastAPI** - веб-фреймворк для REST API
+- **PostgreSQL 15** - реляционная БД
+- **SQLAlchemy 2.0** - ORM для работы с БД
+- **Alembic** - миграции БД
+- **APScheduler** - планировщик для периодических задач
+- **Pydantic** - валидация данных
+- **python-jose** - JWT токены
+- **httpx** - HTTP клиент для парсинга
+- **Playwright** - автоматизация браузера для обхода антибот-системы
+- **playwright-stealth** - библиотека для обхода детекции автоматизации браузера
+- **BeautifulSoup4** - парсинг HTML (резервный вариант)
+- **Docker & docker-compose** - контейнеризация
+
+## Установка и запуск
+
+### Требования
+
+- Docker и Docker Compose
+- Или Python 3.11+ и PostgreSQL 15+
+
+### Запуск через Docker Compose (рекомендуется)
+
+1. Клонируйте репозиторий:
+```bash
+cd housing-complex-service
+```
+
+2. Создайте файл `.env` (опционально, для кастомизации):
+```bash
+cp .env.example .env
+# Отредактируйте .env при необходимости
+```
+
+3. Запустите сервисы:
+```bash
+docker-compose up --build
+```
+
+4. Приложение будет доступно по адресу:
+   - API: http://localhost:8000
+   - Документация API: http://localhost:8000/docs
+   - PostgreSQL: localhost:5432
+
+### Запуск без Docker
+
+1. Установите зависимости:
+```bash
+pip install -r requirements.txt
+```
+
+2. **Установите браузеры Playwright** (обязательно для парсера):
+```bash
+playwright install chromium
+```
+или для установки всех браузеров:
+```bash
+playwright install
+```
+
+**Важно:** Playwright требует установки браузеров отдельной командой после установки Python-пакета.
+
+3. Убедитесь, что PostgreSQL запущен и создайте БД:
+```sql
+CREATE DATABASE housing_db;
+```
+
+4. Создайте `.env` файл с настройками:
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/housing_db
+SECRET_KEY=your-secret-key-here
+PARSER_CITY=Москва  # Город для поиска ЖК
+PARSER_HEADLESS=True  # Запуск браузера в headless режиме (True/False)
+PARSER_BROWSER_TIMEOUT=30000  # Таймаут ожидания элементов в мс
+PARSER_PAGE_SIZE=1000  # Размер страницы для пагинации (количество записей за один запрос)
+PARSER_MAX_RESULTS=0  # Максимальное количество результатов (0 = без лимита, загружать все)
+PARSER_SCHEDULER_HOURS=6  # Интервал актуализации данных в часах
+```
+
+5. Примените миграции (если используете):
+```bash
+alembic upgrade head
+```
+
+6. Запустите приложение:
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## Использование API
+
+### Базовые настройки
+
+```bash
+# Базовый URL
+BASE_URL="http://localhost:8000/api/v1"
+```
+
+---
+
+### 1. Авторизация
+
+#### 1.1. Регистрация нового пользователя
+
+```bash
+curl -X POST "${BASE_URL}/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "admin",
+    "password": "admin123"
+  }'
+```
+
+**Ответ:**
+```json
+{
+  "id": 1,
+  "username": "admin",
+  "is_active": true
+}
+```
+
+#### 1.2. Вход (получение JWT токена)
+
+```bash
+TOKEN=$(curl -s -X POST "${BASE_URL}/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=admin&password=admin123" | jq -r '.access_token')
+
+echo "Token: $TOKEN"
+```
+
+**Ответ:**
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+#### 1.3. Получить информацию о текущем пользователе
+
+```bash
+curl -X GET "${BASE_URL}/auth/me" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Ответ:**
+```json
+{
+  "id": 1,
+  "username": "admin",
+  "is_active": true
+}
+```
+
+---
+
+### 2. Привязки (Bindings)
+
+**Важно:** 
+- ЖК в таблице `housing_complexes` (создаются автоматически после актуализации данных)
+- Дома создаются автоматически при создании привязки (по адресу)
+- Если дом с таким адресом уже существует, он будет использован, а `floors` и `apartments_count` будут обновлены, если указаны
+
+#### 2.1. Создать привязку дома к ЖК
+
+**Важно:** Дом создается автоматически по адресу. Если дом с таким адресом уже существует, используется существующий.
+
+```bash
+# Вариант 1: Использование переменной для JSON (рекомендуется для кириллицы)
+JSON_DATA='{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}'
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-raw "$JSON_DATA"
+
+# Вариант 2: Прямая передача (может не работать с кириллицей в некоторых оболочках)
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}'
+```
+
+**Ответ:**
+```json
+{
+  "id": 1,
+  "house_id": 1,
+  "housing_complex_id": 1,
+  "created_at": "2025-11-18T10:00:00",
+  "house": {
+    "id": 1,
+    "address": "г. Москва, ул. Тестовая, д. 1"
+  },
+  "housing_complex": {
+    "id": 1,
+    "name": "Название ЖК",
+    "developer": "Застройщик"
+  }
+}
+```
+
+#### 2.2. Получить список всех привязок
+
+```bash
+curl -X GET "${BASE_URL}/bindings?skip=0&limit=10" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Ответ:**
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "house_id": 1,
+      "housing_complex_id": 1,
+      "created_at": "2025-11-18T10:00:00",
+      "house": {...},
+      "housing_complex": {...}
+    }
+  ],
+  "total": 1
+}
+```
+
+#### 2.3. Получить привязки с фильтрацией по ID дома
+
+```bash
+curl -X GET "${BASE_URL}/bindings?house_id=1" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 2.4. Получить привязки с фильтрацией по ID ЖК
+
+```bash
+curl -X GET "${BASE_URL}/bindings?housing_complex_id=1" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 2.5. Получить привязки с комбинированными фильтрами и пагинацией
+
+```bash
+curl -X GET "${BASE_URL}/bindings?house_id=1&housing_complex_id=1&skip=0&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 2.6. Удалить привязку
+
+```bash
+curl -X DELETE "${BASE_URL}/bindings/1" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Ответ:** 204 No Content (без тела ответа)
+
+---
+
+### 3. Тестирование ошибок
+
+#### 3.1. Попытка входа с неверными данными
+
+```bash
+curl -X POST "${BASE_URL}/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=wrong&password=wrong"
+```
+
+**Ожидается:** 401 Unauthorized
+
+#### 3.2. Попытка регистрации с существующим именем
+
+```bash
+curl -X POST "${BASE_URL}/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "password123"}'
+```
+
+**Ожидается:** 400 Bad Request
+
+#### 3.3. Доступ к защищенному эндпоинту без токена
+
+```bash
+curl -X GET "${BASE_URL}/bindings"
+```
+
+**Ожидается:** 401 Unauthorized
+
+#### 3.4. Создание привязки с несуществующим ЖК
+
+```bash
+JSON_DATA='{"housing_complex_id": 99999, "address": "г. Москва, ул. Тестовая, д. 1"}'
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-raw "$JSON_DATA"
+```
+
+**Ожидается:** 404 Not Found (ЖК не найден)
+
+---
+
+### 4. Проверка данных в БД перед тестированием привязок
+
+```bash
+# Подключение к БД через Docker
+docker-compose exec db psql -U postgres -d housing_db
+```
+
+```sql
+-- Посмотреть доступные ЖК
+SELECT id, name, developer FROM housing_complexes LIMIT 10;
+
+-- Посмотреть доступные дома (создаются автоматически при создании привязки)
+SELECT id, address, floors, apartments_count FROM houses LIMIT 10;
+```
+
+---
+
+### 5. Swagger UI (интерактивная документация)
+
+Откройте в браузере: **http://localhost:8000/docs**
+
+Позволяет тестировать все эндпоинты напрямую через веб-интерфейс с авторизацией.
+
+---
+
+### 6. Полный тестовый скрипт
+
+Создайте файл `test_api.sh` для автоматического тестирования всех эндпоинтов:
+
+```bash
+#!/bin/bash
+
+BASE_URL="http://localhost:8000/api/v1"
+
+echo "=== Тестирование Housing Complex Service API ==="
+echo ""
+
+# 1. Регистрация пользователя
+echo "1. Регистрация пользователя:"
+REGISTER_RESPONSE=$(curl -s -X POST "${BASE_URL}/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "testuser",
+    "password": "test123"
+  }')
+echo "$REGISTER_RESPONSE" | jq '.'
+echo ""
+
+# Проверка успешной регистрации
+if echo "$REGISTER_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+  echo "✓ Регистрация успешна"
+else
+  echo "✗ Ошибка регистрации"
+  exit 1
+fi
+echo ""
+
+# 2. Вход
+echo "2. Вход и получение токена:"
+TOKEN=$(curl -s -X POST "${BASE_URL}/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=testuser&password=test123" | jq -r '.access_token')
+
+if [ "$TOKEN" != "null" ] && [ -n "$TOKEN" ]; then
+  echo "✓ Токен получен: ${TOKEN:0:30}..."
+else
+  echo "✗ Ошибка получения токена"
+  exit 1
+fi
+echo ""
+
+# 3. Получение информации о текущем пользователе
+echo "3. Информация о текущем пользователе:"
+ME_RESPONSE=$(curl -s -X GET "${BASE_URL}/auth/me" \
+  -H "Authorization: Bearer $TOKEN")
+echo "$ME_RESPONSE" | jq '.'
+echo ""
+
+# 4. Получение списка ЖК из БД (для тестирования привязок)
+echo "4. Получение списка ЖК (через SQL, нужен доступ к БД):"
+echo "Выполните в БД: SELECT id, name FROM housing_complexes LIMIT 1;"
+echo ""
+
+# 5. Получение списка привязок
+echo "5. Список привязок:"
+BINDINGS_RESPONSE=$(curl -s -X GET "${BASE_URL}/bindings?skip=0&limit=10" \
+  -H "Authorization: Bearer $TOKEN")
+echo "$BINDINGS_RESPONSE" | jq '.'
+echo ""
+
+# 6. Создание привязки (если есть ЖК с ID=1)
+echo "6. Создание привязки (требуется ЖК с ID=1):"
+BINDING_JSON='{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}'
+CREATE_BINDING_RESPONSE=$(curl -s -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-raw "$BINDING_JSON")
+
+if echo "$CREATE_BINDING_RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+  echo "$CREATE_BINDING_RESPONSE" | jq '.'
+  BINDING_ID=$(echo "$CREATE_BINDING_RESPONSE" | jq -r '.id')
+  echo "✓ Привязка создана с ID: $BINDING_ID"
+  
+  # 7. Удаление привязки
+  echo ""
+  echo "7. Удаление привязки (ID: $BINDING_ID):"
+  DELETE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE "${BASE_URL}/bindings/$BINDING_ID" \
+    -H "Authorization: Bearer $TOKEN")
+  HTTP_CODE=$(echo "$DELETE_RESPONSE" | grep -o "HTTP_CODE:[0-9]*" | cut -d: -f2)
+  if [ "$HTTP_CODE" = "204" ]; then
+    echo "✓ Привязка удалена (HTTP 204)"
+  else
+    echo "✗ Ошибка удаления (HTTP $HTTP_CODE)"
+  fi
+else
+  echo "$CREATE_BINDING_RESPONSE" | jq '.'
+  echo "⚠ Создание привязки не удалось (возможно, нет ЖК с ID=1)"
+fi
+echo ""
+
+echo "=== Тестирование завершено ==="
+```
+
+Использование:
+```bash
+chmod +x test_api.sh
+./test_api.sh
+```
+
+**Требования:**
+- `jq` для парсинга JSON (установка: `sudo apt-get install jq` или `brew install jq`)
+- Запущенный сервис на `http://localhost:8000`
+- ЖК в БД для тестирования привязок (создаются автоматически после актуализации данных)
+
+## Конфигурация
+
+Настройки приложения находятся в `app/config.py` и могут быть переопределены через переменные окружения (файл `.env`):
+
+- `DATABASE_URL` - строка подключения к PostgreSQL
+- `SECRET_KEY` - секретный ключ для JWT (измените в продакшене!)
+- `ALGORITHM` - алгоритм подписи JWT (по умолчанию HS256)
+- `ACCESS_TOKEN_EXPIRE_MINUTES` - время жизни токена (по умолчанию 30 минут)
+- `PARSER_CITY` - город для парсинга (по умолчанию "Москва")
+- `PARSER_SCHEDULER_HOURS` - интервал актуализации данных в часах (по умолчанию 6)
+- `PARSER_HEADLESS` - запуск браузера в headless режиме (по умолчанию True)
+- `PARSER_BROWSER_TIMEOUT` - таймаут ожидания элементов в миллисекундах (по умолчанию 30000)
+- `PARSER_PAGE_SIZE` - размер страницы для пагинации, количество записей за один запрос (по умолчанию 1000)
+- `PARSER_MAX_RESULTS` - максимальное количество результатов для загрузки (0 = без лимита, загружать все) (по умолчанию 0)
+- `API_V1_PREFIX` - префикс API (по умолчанию "/api/v1")
+
+## Миграции БД
+
+Для создания миграций:
+
+```bash
+alembic revision --autogenerate -m "описание миграции"
+```
+
+Для применения миграций:
+
+```bash
+alembic upgrade head
+```
+
+## Особенности реализации
+
+### Парсер
+
+- Использует **Playwright с Stealth** для обхода антибот-системы ServicePipe
+- Выполняет API запросы через `page.evaluate()` с JavaScript fetch для максимальной имитации браузера
+- Использует известный API endpoint `/сервисы/api/kn/object` для получения данных
+- Парсит JSON ответы (структура `data.list`) вместо HTML
+- Поддерживает headless и non-headless режимы через конфигурацию
+- Реализован с обработкой ошибок и логированием
+
+### Актуализация данных
+
+- Использует SHA-256 хэш для отслеживания изменений
+- Хэшируются только значимые поля (name, description, developer) - адрес хранится у домов, не у ЖК
+- Новые ЖК добавляются, изменившиеся обновляются, неизменившиеся пропускаются
+- Данные сохраняются батчами (по 100 записей) для оптимизации производительности
+
+### Авторизация
+
+- Пользователи хранятся в БД (таблица `users`)
+- Нет предсозданных пользователей - необходимо зарегистрироваться через `/auth/register`
+- Пароли хранятся в хэшированном виде (bcrypt)
+- JWT токены выдаются на 30 минут (настраивается)
+- Защищенные эндпоинты требуют заголовок `Authorization: Bearer <token>`
+
+## Помощь ИИ (Cursor)
+
+Этот проект был разработан с использованием ИИ-ассистента Cursor. Основная помощь заключалась в:
+
+1. **Проектирование структуры проекта** - создание логичной и расширяемой архитектуры
+2. **Генерация кода** - написание базового кода для всех компонентов
+3. **Интеграция технологий** - правильное соединение FastAPI, SQLAlchemy, APScheduler, JWT
+4. **Обработка ошибок** - добавление валидации, обработки исключений
+5. **Docker конфигурация** - настройка контейнеризации и docker-compose
+6. **Документация** - написание README с подробным описанием
+
+ИИ помог ускорить разработку, обеспечив базовый рабочий скелет приложения, который затем был адаптирован под конкретные требования задачи.
+
+## Тестирование
+
+### Тестирование парсера
+
+Для тестирования парсера отдельно используйте:
+
+```bash
+python -m tests.test_parser
+```
+
+Этот скрипт проверяет:
+- Получение данных от API наш.дом.рф
+- Обход антибот-системы
+- Фильтрацию по городу
+- Преобразование в DTO
+
+### Тестирование API через curl
+
+Для тестирования всех эндпоинтов API используйте bash-скрипт:
+
+```bash
+# Сделать скрипт исполняемым (если еще не сделано)
+chmod +x tests/test_api.sh
+
+# Запустить тесты
+./tests/test_api.sh
+
+# Или с указанием другого URL
+BASE_URL="http://localhost:8000/api/v1" ./tests/test_api.sh
+```
+
+Скрипт `tests/test_api.sh` автоматически тестирует:
+
+1. ✅ Регистрация пользователя
+2. ✅ Регистрация с существующим именем (ожидается ошибка 400)
+3. ✅ Вход и получение JWT токена
+4. ✅ Вход с неверными данными (ожидается ошибка 401)
+5. ✅ Получение информации о текущем пользователе
+6. ✅ Доступ к защищенному эндпоинту без токена (ожидается ошибка 401)
+7. ✅ Получение списка привязок
+8. ✅ Создание привязки (автоматическое создание дома)
+9. ✅ Создание привязки с несуществующим ЖК (ожидается ошибка 404)
+10. ✅ Удаление привязки
+11. ✅ Фильтрация привязок по house_id
+12. ✅ Фильтрация привязок по housing_complex_id
+
+**Требования:**
+- `curl` для HTTP запросов
+- `jq` опционально (для парсинга JSON, если нет - используется grep)
+- Запущенный сервис на `http://localhost:8000`
+
+**Пример вывода:**
+```
+==========================================
+  Тестирование Housing Complex Service API
+==========================================
+Base URL: http://localhost:8000/api/v1
+Test username: testuser_1734528000
+
+=== Тест 1: Регистрация пользователя ===
+✓ Регистрация пользователя (ID: 1)
+
+=== Тест 2: Регистрация с существующим именем ===
+✓ Регистрация с существующим именем вернула 400
+
+...
+
+==========================================
+  Итоги тестирования
+==========================================
+  Всего тестов: 12
+  Пройдено: 12
+  Провалено: 0
+
+✓ Все тесты пройдены успешно!
+```
+
+## Дальнейшее развитие
+
+Возможные улучшения:
+
+1. Добавить API эндпоинты для управления домами и ЖК (CRUD)
+2. Добавить API для просмотра списка ЖК с фильтрацией и поиском
+3. Добавить логирование в файл
+4. Добавить unit-тесты (pytest)
+5. Настроить CI/CD
+6. Добавить метрики и мониторинг (Prometheus, Grafana)
+7. Оптимизировать запросы к БД (индексы, кэширование)
+8. Добавить эндпоинт для ручного запуска актуализации данных
+
+## Лицензия
+
+MIT
