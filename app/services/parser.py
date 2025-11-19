@@ -206,7 +206,7 @@ class NashDomParser:
         Маппинг полей API наш.дом.рф:
         - hobjId → id (идентификатор объекта)
         - objCommercNm → name (название ЖК)
-        - objAddr → address (адрес)
+        - shortAddr → address (адрес ЖК, используется для фильтрации по городу)
         - developer.shortName/fullName → developer (застройщик как строка)
         - siteStatus → status (статус ЖК)
         - latitude/longitude → координаты (уже в нужном формате)
@@ -227,10 +227,10 @@ class NashDomParser:
         if not mapped_name or mapped_name == 'Неизвестный ЖК':
             mapped_name = 'Неизвестный ЖК'
         
-        # Извлекаем адрес: используем objAddr
-        mapped_address = item.get('objAddr', item.get('address', item.get('location', 'Адрес не указан')))
-        if not mapped_address or mapped_address == 'Адрес не указан':
-            mapped_address = 'Адрес не указан'
+        # Извлекаем адрес: используем shortAddr из JSON
+        mapped_address = item.get('shortAddr', item.get('objAddr', item.get('address', item.get('location', None))))
+        if not mapped_address:
+            mapped_address = None
         
         # Извлекаем застройщика: developer - это объект, нужно извлечь строку
         dev_obj = item.get('developer')

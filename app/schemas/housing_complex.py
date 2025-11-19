@@ -7,6 +7,7 @@ from typing import Optional
 class HousingComplexBase(BaseModel):
     """Базовая схема жилого комплекса."""
     name: str = Field(..., max_length=500, description="Название ЖК")
+    address: Optional[str] = Field(None, max_length=500, description="Адрес ЖК")
     description: Optional[str] = Field(None, description="Описание ЖК")
     developer: Optional[str] = Field(None, max_length=300, description="Застройщик")
 

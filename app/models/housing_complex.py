@@ -13,6 +13,7 @@ class HousingComplex(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(500), nullable=False, index=True)
+    address = Column(String(500), nullable=True, index=True)
     description = Column(Text)
     developer = Column(String(300))
     # URL источника для отслеживания изменений
@@ -31,9 +32,9 @@ class HousingComplex(Base):
     )
     
     @classmethod
-    def calculate_hash(cls, name: str, description: str = None, developer: str = None) -> str:
+    def calculate_hash(cls, name: str, address: str = None, description: str = None, developer: str = None) -> str:
         """Вычислить хэш значимых полей."""
-        data_str = f"{name}|{description or ''}|{developer or ''}"
+        data_str = f"{name}|{address or ''}|{description or ''}|{developer or ''}"
         return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
     
     def __repr__(self):

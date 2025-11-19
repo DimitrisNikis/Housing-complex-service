@@ -60,7 +60,8 @@ housing-complex-service/
 │
 ├── tests/                   # Тесты
 │   ├── __init__.py
-│   └── test_parser.py       # Тесты парсера
+│   ├── test_parser.py       # Тесты парсера
+│   └── test_api.sh          # Bash-скрипт для тестирования API через curl
 │
 ├── scripts/                 # Вспомогательные скрипты
 │   └── init_test_data.py    # Инициализация тестовых данных
@@ -77,10 +78,10 @@ housing-complex-service/
 #### 1. Модели данных (SQLAlchemy)
 
 - **HousingComplex** - жилые комплексы
-  - Поля: `id`, `name`, `description`, `developer`, `source_url`, `data_hash`, `created_at`, `updated_at`
-  - `data_hash` используется для отслеживания изменений (SHA-256 хэш значимых полей: name, description, developer)
+  - Поля: `id`, `name`, `address`, `description`, `developer`, `source_url`, `data_hash`, `created_at`, `updated_at`
+  - `address` - адрес ЖК, извлекается из `shortAddr` при парсинге (используется для фильтрации по городу)
+  - `data_hash` используется для отслеживания изменений (SHA-256 хэш значимых полей: name, address, description, developer)
   - `source_url` уникальный (формируется из `hobjId`: `/сервисы/kn/{hobjId}`)
-  - Адрес хранится у домов, а не у ЖК
   
 - **House** - дома
   - Поля: `id`, `address` (уникальный), `floors` (этажность, опционально), `apartments_count` (количество квартир, опционально)
@@ -101,19 +102,23 @@ housing-complex-service/
 - Выполняет API запросы через `page.evaluate()` с JavaScript fetch для максимальной имитации браузера
 - Использует известный API endpoint `/сервисы/api/kn/object`
 - Парсит JSON ответы (структура `data.list`) вместо HTML
+- Извлекает поле `shortAddr` из JSON и сохраняет его в `address` модели ЖК
+- Фильтрация по городу выполняется по полю `shortAddr` через регулярное выражение
 - Поддерживает headless и non-headless режимы (настраивается через `PARSER_HEADLESS`)
-- Настраивается через `config.py` (город, режим браузера, таймауты)
+- Настраивается через `config.py` (город, режим браузера, таймауты, пагинация)
 
 #### 3. Актуализация данных (`app/services/updater.py`)
 
 - Класс `DataUpdater` для обновления данных о ЖК
 - Логика работы:
-  1. Парсит данные из источника
-  2. Для каждого ЖК вычисляет хэш значимых полей
-  3. Ищет существующий ЖК по `source_url`
-  4. Если не найден → добавляет новый
-  5. Если найден и хэш изменился → обновляет данные
-  6. Если найден и хэш не изменился → пропускает
+  1. Парсит данные из источника с пагинацией
+  2. Фильтрует результаты по городу через `shortAddr` (регулярное выражение)
+  3. Для каждого ЖК вычисляет хэш значимых полей (name, address, description, developer)
+  4. Ищет существующий ЖК по `source_url`
+  5. Если не найден → добавляет новый (включая `address` из `shortAddr`)
+  6. Если найден и хэш изменился → обновляет данные (включая `address`)
+  7. Если найден и хэш не изменился → пропускает
+  8. Данные сохраняются батчами (по 100 записей) для оптимизации
 
 #### 4. Периодическая задача (APScheduler)
 
@@ -237,7 +242,7 @@ PARSER_HEADLESS=True  # Запуск браузера в headless режиме (
 PARSER_BROWSER_TIMEOUT=30000  # Таймаут ожидания элементов в мс
 PARSER_PAGE_SIZE=1000  # Размер страницы для пагинации (количество записей за один запрос)
 PARSER_MAX_RESULTS=0  # Максимальное количество результатов (0 = без лимита, загружать все)
-PARSER_SCHEDULER_HOURS=6  # Интервал актуализации данных в часах
+PARSER_SCHEDULER_HOURS=3  # Интервал актуализации данных в часах
 ```
 
 5. Примените миграции (если используете):
@@ -331,19 +336,36 @@ curl -X GET "${BASE_URL}/auth/me" \
 **Важно:** Дом создается автоматически по адресу. Если дом с таким адресом уже существует, используется существующий.
 
 ```bash
-# Вариант 1: Использование переменной для JSON (рекомендуется для кириллицы)
+# Вариант 1: Компактный JSON в одной строке (рекомендуется для Git Bash на Windows)
 JSON_DATA='{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}'
 curl -X POST "${BASE_URL}/bindings" \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   --data-raw "$JSON_DATA"
 
-# Вариант 2: Прямая передача (может не работать с кириллицей в некоторых оболочках)
+# Вариант 2: Использование printf с pipe (наиболее надежный для кириллицы)
+printf '%s' '{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}' | \
 curl -X POST "${BASE_URL}/bindings" \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  --data-binary @-
+
+# Вариант 3: Использование jq для создания JSON (если установлен)
+BINDING_JSON=$(jq -cn --arg hc_id "1" --arg addr "г. Москва, ул. Тестовая, д. 1" --argjson floors 10 --argjson apt_count 100 '{housing_complex_id: ($hc_id | tonumber), address: $addr, floors: $floors, apartments_count: $apt_count}')
+printf '%s' "$BINDING_JSON" | \
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  --data-binary @-
+
+# Вариант 4: Прямая передача (может не работать с кириллицей в некоторых оболочках)
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
   -d '{"housing_complex_id": 1, "address": "г. Москва, ул. Тестовая, д. 1", "floors": 10, "apartments_count": 100}'
 ```
+
+**Примечание:** В Git Bash на Windows многострочный JSON с переносами строк может работать некорректно. Используйте компактный JSON в одной строке (Вариант 1) или pipe с `printf` (Вариант 2).
 
 **Ответ:**
 ```json
@@ -453,11 +475,19 @@ curl -X GET "${BASE_URL}/bindings"
 #### 3.4. Создание привязки с несуществующим ЖК
 
 ```bash
+# Компактный JSON в одной строке
 JSON_DATA='{"housing_complex_id": 99999, "address": "г. Москва, ул. Тестовая, д. 1"}'
 curl -X POST "${BASE_URL}/bindings" \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   --data-raw "$JSON_DATA"
+
+# Или с pipe (наиболее надежно для кириллицы)
+printf '%s' '{"housing_complex_id": 99999, "address": "г. Москва, ул. Тестовая, д. 1"}' | \
+curl -X POST "${BASE_URL}/bindings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  --data-binary @-
 ```
 
 **Ожидается:** 404 Not Found (ЖК не найден)
@@ -473,7 +503,7 @@ docker-compose exec db psql -U postgres -d housing_db
 
 ```sql
 -- Посмотреть доступные ЖК
-SELECT id, name, developer FROM housing_complexes LIMIT 10;
+SELECT id, name, address, developer FROM housing_complexes LIMIT 10;
 
 -- Посмотреть доступные дома (создаются автоматически при создании привязки)
 SELECT id, address, floors, apartments_count FROM houses LIMIT 10;
@@ -607,11 +637,11 @@ chmod +x test_api.sh
 - `ALGORITHM` - алгоритм подписи JWT (по умолчанию HS256)
 - `ACCESS_TOKEN_EXPIRE_MINUTES` - время жизни токена (по умолчанию 30 минут)
 - `PARSER_CITY` - город для парсинга (по умолчанию "Москва")
-- `PARSER_SCHEDULER_HOURS` - интервал актуализации данных в часах (по умолчанию 6)
+- `PARSER_SCHEDULER_HOURS` - интервал актуализации данных в часах (по умолчанию 3)
 - `PARSER_HEADLESS` - запуск браузера в headless режиме (по умолчанию True)
 - `PARSER_BROWSER_TIMEOUT` - таймаут ожидания элементов в миллисекундах (по умолчанию 30000)
 - `PARSER_PAGE_SIZE` - размер страницы для пагинации, количество записей за один запрос (по умолчанию 1000)
-- `PARSER_MAX_RESULTS` - максимальное количество результатов для загрузки (0 = без лимита, загружать все) (по умолчанию 0)
+- `PARSER_MAX_RESULTS` - максимальное количество результатов для загрузки (0 = без лимита, загружать все) (по умолчанию 1500)
 - `API_V1_PREFIX` - префикс API (по умолчанию "/api/v1")
 
 ## Миграции БД
@@ -636,13 +666,19 @@ alembic upgrade head
 - Выполняет API запросы через `page.evaluate()` с JavaScript fetch для максимальной имитации браузера
 - Использует известный API endpoint `/сервисы/api/kn/object` для получения данных
 - Парсит JSON ответы (структура `data.list`) вместо HTML
+- Извлекает поле `shortAddr` из JSON и сохраняет его в поле `address` модели ЖК
+- Фильтрация по городу выполняется по полю `shortAddr` через регулярное выражение (ищет паттерн "г. {город}" или просто "{город}")
+- Поддерживает пагинацию для загрузки всех доступных данных
 - Поддерживает headless и non-headless режимы через конфигурацию
 - Реализован с обработкой ошибок и логированием
 
 ### Актуализация данных
 
 - Использует SHA-256 хэш для отслеживания изменений
-- Хэшируются только значимые поля (name, description, developer) - адрес хранится у домов, не у ЖК
+- Хэшируются значимые поля: `name`, `address` (из `shortAddr`), `description`, `developer`
+- Парсер извлекает `shortAddr` из JSON ответа API и сохраняет его в поле `address` модели ЖК
+- Фильтрация по городу выполняется по полю `shortAddr` через регулярное выражение (ищет паттерн "г. {город}")
+- Поддерживает пагинацию через `PARSER_PAGE_SIZE` и ограничение через `PARSER_MAX_RESULTS`
 - Новые ЖК добавляются, изменившиеся обновляются, неизменившиеся пропускаются
 - Данные сохраняются батчами (по 100 записей) для оптимизации производительности
 

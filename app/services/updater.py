@@ -107,6 +107,7 @@ class DataUpdater:
                 
                 new_hash = calculate_data_hash(
                     name=complex_dto.name,
+                    address=complex_dto.address,
                     description=None,  # Описание не входит в ComplexParsedDTO
                     developer=complex_dto.developer
                 )
@@ -120,6 +121,7 @@ class DataUpdater:
                     # Новый ЖК - добавляем
                     new_complex = HousingComplex(
                         name=complex_dto.name,
+                        address=complex_dto.address,
                         description=None,  # Описание не входит в ComplexParsedDTO
                         developer=complex_dto.developer,
                         source_url=source_url,
@@ -133,6 +135,7 @@ class DataUpdater:
                     if existing.data_hash != new_hash:
                         # Данные изменились - обновляем
                         existing.name = complex_dto.name
+                        existing.address = complex_dto.address
                         existing.developer = complex_dto.developer
                         existing.data_hash = new_hash
                         updated_count += 1
