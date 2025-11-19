@@ -26,8 +26,8 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/housing_db
-      SECRET_KEY: your-secret-key-change-in-production
-      PARSER_SCHEDULER_HOURS: 6
+      SECRET_KEY: secret-key
+      PARSER_SCHEDULER_HOURS: 3
     ports:
       - "8000:8000"
     volumes:
