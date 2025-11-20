@@ -372,22 +372,22 @@ class NashDomParser:
             result = await page.evaluate(js_code)
             
             if not result:
-                logger.error("❌ JSON не удалось получить - результат пустой")
+                logger.error("JSON не удалось получить - результат пустой")
                 return []
             
             if 'error' in result:
-                logger.error(f"❌ Ошибка при выполнении запроса: {result['error']}")
+                logger.error(f"Ошибка при выполнении запроса: {result['error']}")
                 raise Exception(f"API запрос не удался: {result['error']}")
             
-            logger.info(f"✓ Получен JSON ответ от API")
+            logger.info(f"Получен JSON ответ от API")
             
             # Сохраняем JSON для отладки
-            try:
-                with open("debug_api_response.json", "w", encoding="utf-8") as f:
-                    json.dump(result, f, ensure_ascii=False, indent=2)
-                logger.debug("JSON ответ сохранён в debug_api_response.json")
-            except Exception as e:
-                logger.debug(f"Не удалось сохранить JSON: {e}")
+            # try:
+            #     with open("debug_api_response.json", "w", encoding="utf-8") as f:
+            #         json.dump(result, f, ensure_ascii=False, indent=2)
+            #     logger.debug("JSON ответ сохранён в debug_api_response.json")
+            # except Exception as e:
+            #     logger.debug(f"Не удалось сохранить JSON: {e}")
             
             # Извлекаем список ЖК из JSON
             complexes_list = self._extract_complexes_from_json(result)
@@ -427,7 +427,7 @@ class NashDomParser:
                     logger.debug(f"Проблемные данные: {item}")
                     continue
             
-            logger.info(f"✓ Успешно обработано {len(complexes)} ЖК из {len(complexes_list)} полученных")
+            logger.info(f"Успешно обработано {len(complexes)} ЖК из {len(complexes_list)} полученных")
             
             if return_metadata:
                 return FetchResult(complexes=complexes, total_requested=total_requested)
